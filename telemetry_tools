@@ -1,0 +1,251 @@
+# telemetry_tools.py
+from __future__ import annotations
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Iterable
+from math import isnan
+
+# ---------- Time parsing helpers ----------
+
+def parse_iso(ts: Optional[str]) -> Optional[datetime]:
+    """Parse 'YYYY-MM-DDTHH:MM:SS[.ffffff][Z]' -> datetime (naive UTC)."""
+    if not isinstance(ts, str):
+        return None
+    if ts.endswith("Z"):
+        ts = ts[:-1]
+    try:
+        return datetime.fromisoformat(ts)
+    except Exception:
+        return None
+
+# ---------- Day 3/4 utilities ----------
+
+def packets_since(packets: Iterable[Dict[str, Any]], seconds: int, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
+    now = now or datetime.utcnow()
+    cutoff = now - timedelta(seconds=seconds)
+    out = []
+    for p in packets:
+        ts = parse_iso(p.get("timestamp"))
+        if ts and ts >= cutoff:
+            out.append(p)
+    return out
+
+def first_timestamp_after_gap(packets: Iterable[Dict[str, Any]]) -> Optional[str]:
+    """
+    Given packets [{'seq': int, 'timestamp': iso}, ...], return ISO timestamp
+    of the first packet after the first detected sequence gap. If no gap -> None.
+    """
+    best: Dict[int, str] = {}
+    for p in packets:
+        try:
+            s = int(p.get("seq"))
+        except Exception:
+            continue
+        ts = p.get("timestamp")
+        if s not in best and isinstance(ts, str):
+            best[s] = ts
+    if not best:
+        return None
+    seqs = sorted(best.keys())
+    prev = seqs[0]
+    for s in seqs[1:]:
+        if s > prev + 1:
+            return best[s]
+        prev = s
+    return None
+
+# ---------- Day 4: gaps / reorder / merge ----------
+
+def detect_sequence_gaps(packets: Iterable[Dict[str, Any]]) -> List[Dict[str, int]]:
+    """Return [{'gap_start': a, 'gap_end': b}, ...] for every missing run."""
+    seqs = sorted({int(p["seq"]) for p in packets if "seq" in p and p["seq"] is not None})
+    gaps: List[Dict[str, int]] = []
+    if not seqs:
+        return gaps
+    prev = seqs[0]
+    for s in seqs[1:]:
+        if s > prev + 1:
+            gaps.append({"gap_start": prev + 1, "gap_end": s - 1})
+        prev = s
+    return gaps
+
+def _parse_ts_loose(ts: Any) -> Optional[datetime]:
+    return parse_iso(ts) if isinstance(ts, str) else None
+
+def reorder_by_seq_and_timestamp(packets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Sort by (seq ASC, timestamp ASC). Missing/invalid ts treated as oldest.
+    Packets missing 'seq' are skipped by this function (use merge for no-seq).
+    """
+    prepared = []
+    for idx, p in enumerate(packets):
+        if "seq" not in p:
+            continue
+        try:
+            seq = int(p["seq"])
+        except Exception:
+            continue
+        ts = _parse_ts_loose(p.get("timestamp"))
+        prepared.append((seq, ts or datetime.min, idx, p))
+    prepared.sort(key=lambda r: (r[0], r[1], r[2]))
+    return [p for *_ , p in prepared]
+
+def merge_ground_stations(gs1_packets: List[Dict[str, Any]],
+                          gs2_packets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Merge two streams, dedupe, and order:
+      - packets WITH seq first, ordered by (seq, ts)
+      - packets WITHOUT seq after, ordered by ts
+    Dedupe rule:
+      - If seq present -> dedupe by seq (first occurrence wins)
+      - If no seq -> dedupe by timestamp (first occurrence wins)
+    """
+    combined = list(gs1_packets) + list(gs2_packets)
+
+    seen = set()
+    deduped: List[Dict[str, Any]] = []
+    for p in combined:
+        seq_key = None
+        try:
+            if "seq" in p and p["seq"] is not None:
+                seq_key = int(p["seq"])
+        except Exception:
+            seq_key = None
+        ts = _parse_ts_loose(p.get("timestamp"))
+        key = ("seq", seq_key) if seq_key is not None else ("ts", ts)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(p)
+
+    def sort_key(pkt: Dict[str, Any]):
+        try:
+            seq_val = int(pkt["seq"]) if "seq" in pkt and pkt["seq"] is not None else None
+        except Exception:
+            seq_val = None
+        ts_val = _parse_ts_loose(pkt.get("timestamp")) or datetime.min
+        if seq_val is not None:
+            return (0, seq_val, ts_val)
+        else:
+            return (1, float("inf"), ts_val)
+
+    deduped.sort(key=sort_key)
+    return deduped
+
+# ---------- Day 5: anomaly detection ----------
+
+def _has_nan_quaternion(q: Any) -> bool:
+    if not isinstance(q, (list, tuple)) or len(q) == 0:
+        return False
+    try:
+        return any(isnan(float(v)) for v in q)
+    except Exception:
+        return False
+
+def detect_anomalies(packets: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Rules:
+      - THERMAL.temp_batt > 80°C
+      - POWER.bus_voltage < 20V
+      - NAV.quaternion contains NaN
+      - POWER.current_draw < 0 unless POWER.mode == 'regen'
+    Returns: [{'timestamp': iso, 'violations': [..], 'packet': original}, ...]
+    """
+    out: List[Dict[str, Any]] = []
+    for p in packets:
+        violations: List[str] = []
+        ts = p.get("timestamp")
+
+        thermal = p.get("THERMAL", {}) or {}
+        power   = p.get("POWER",   {}) or {}
+        nav     = p.get("NAV",     {}) or {}
+
+        temp_batt    = thermal.get("temp_batt")
+        bus_voltage  = power.get("bus_voltage")
+        current_draw = power.get("current_draw")
+        mode         = (power.get("mode") or "").lower()
+        quat         = nav.get("quaternion")
+
+        if isinstance(temp_batt, (int, float)) and temp_batt > 80.0:
+            violations.append(f"battery_temp_high:{temp_batt}")
+
+        if isinstance(bus_voltage, (int, float)) and bus_voltage < 20.0:
+            violations.append(f"bus_voltage_low:{bus_voltage}")
+
+        if isinstance(current_draw, (int, float)) and current_draw < 0 and mode != "regen":
+            violations.append(f"negative_current:{current_draw}")
+
+        if _has_nan_quaternion(quat):
+            violations.append("quaternion_nan")
+
+        if violations:
+            out.append({"timestamp": ts, "violations": violations, "packet": p})
+    return out
+
+def detect_anomaly_episodes(packets: Iterable[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Episode-based view with start/end/duration/count for:
+      battery_temp_high, bus_voltage_low, negative_current, quaternion_nan
+    """
+    pkts = sorted(list(packets), key=lambda p: parse_iso(p.get("timestamp")) or datetime.min)
+    active = {k: None for k in ("battery_temp_high","bus_voltage_low","negative_current","quaternion_nan")}
+    episodes = {k: [] for k in active}
+
+    def begin(cond: str, t: datetime):
+        if active[cond] is None:
+            active[cond] = {"start": t, "end": None, "count": 0}
+
+    def bump(cond: str):
+        if active[cond] is not None:
+            active[cond]["count"] += 1
+
+    def end(cond: str, t: datetime):
+        ep = active[cond]
+        if ep is not None:
+            ep["end"] = t
+            ep["duration_sec"] = (ep["end"] - ep["start"]).total_seconds() if ep["start"] and ep["end"] else None
+            episodes[cond].append(ep)
+            active[cond] = None
+
+    for p in pkts:
+        t = parse_iso(p.get("timestamp")) or datetime.min
+        thermal = p.get("THERMAL", {}) or {}
+        power   = p.get("POWER",   {}) or {}
+        nav     = p.get("NAV",     {}) or {}
+
+        temp_batt    = thermal.get("temp_batt")
+        bus_voltage  = power.get("bus_voltage")
+        current_draw = power.get("current_draw")
+        mode         = (power.get("mode") or "").lower()
+        quat         = nav.get("quaternion")
+
+        conds = {
+            "battery_temp_high": isinstance(temp_batt, (int,float)) and temp_batt > 80.0,
+            "bus_voltage_low":   isinstance(bus_voltage,(int,float)) and bus_voltage < 20.0,
+            "negative_current":  isinstance(current_draw,(int,float)) and current_draw < 0 and mode != "regen",
+            "quaternion_nan":    _has_nan_quaternion(quat),
+        }
+
+        for cond, bad in conds.items():
+            if bad:
+                if active[cond] is None:
+                    begin(cond, t)
+                bump(cond)
+            else:
+                if active[cond] is not None:
+                    end(cond, t)
+
+    if pkts:
+        last_t = parse_iso(pkts[-1].get("timestamp")) or datetime.min
+        for cond in list(active.keys()):
+            if active[cond] is not None:
+                end(cond, last_t)
+
+    def render(ep: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "start": ep["start"].isoformat() if ep["start"] else None,
+            "end": ep["end"].isoformat() if ep["end"] else None,
+            "duration_sec": ep.get("duration_sec"),
+            "count": ep["count"],
+        }
+
+    return {cond: [render(ep) for ep in eps] for cond, eps in episodes.items()}
