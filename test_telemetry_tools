@@ -1,0 +1,86 @@
+# test_telemetry_tools.py
+from datetime import datetime, timedelta
+from telemetry_tools import (
+    packets_since, first_timestamp_after_gap, detect_sequence_gaps,
+    reorder_by_seq_and_timestamp, merge_ground_stations,
+    detect_anomalies, detect_anomaly_episodes
+)
+
+def iso(base, s):
+    return (base + timedelta(seconds=s)).strftime("%Y-%m-%dT%H:%M:%S")
+
+def test_packets_since_and_first_after_gap():
+    base = datetime(2025, 10, 19, 12, 0, 0)
+    pkts = [
+        {"seq": 100, "timestamp": iso(base, 0)},
+        {"seq": 101, "timestamp": iso(base, 3)},
+        {"seq": 105, "timestamp": iso(base, 10)},
+    ]
+    recent = packets_since(pkts, 5, now=base + timedelta(seconds=10))
+    assert [p["seq"] for p in recent] == [105]
+    assert first_timestamp_after_gap(pkts) == iso(base, 10)
+
+def test_detect_sequence_gaps_and_reorder():
+    pkts = [
+        {"seq": 102, "timestamp": "2025-10-19T12:00:03"},
+        {"seq": 101, "timestamp": "2025-10-19T12:00:01"},
+        {"seq": 104, "timestamp": "2025-10-19T12:00:06"},
+    ]
+    gaps = detect_sequence_gaps(pkts)
+    assert gaps == [{"gap_start": 103, "gap_end": 103}]
+    ordered = reorder_by_seq_and_timestamp(pkts)
+    assert [p["seq"] for p in ordered] == [101, 102, 104]
+
+def test_merge_ground_stations_e2e():
+    base = datetime(2025, 10, 19, 12, 0, 0)
+    gs1 = [
+        {"seq": 101, "timestamp": iso(base, 1), "src": "gs1"},
+        {"seq": 103, "timestamp": iso(base, 7), "src": "gs1"},
+        {"seq": 102, "timestamp": iso(base, 4), "src": "gs1"},
+        {"seq": 103, "timestamp": iso(base, 7), "src": "gs1-dup"},  # dup by seq -> drop
+        {"timestamp": iso(base, 20), "src": "gs1-noseq"},            # no seq
+    ]
+    gs2 = [
+        {"seq": 100, "timestamp": iso(base, 0), "src": "gs2"},
+        {"seq": 104, "timestamp": iso(base, 12), "src": "gs2"},
+        {"seq": 105, "timestamp": iso(base, 15), "src": "gs2"},
+        {"timestamp": iso(base, 20), "src": "gs2-noseq-dup-ts"},     # dup ts -> drop
+        {"seq": 106, "timestamp": iso(base, 17), "src": "gs2"},
+        {"seq": 104, "timestamp": iso(base, 12), "src": "gs2-dup"},  # dup by seq -> drop
+    ]
+    merged = merge_ground_stations(gs1, gs2)
+    seqd = [p for p in merged if p.get("seq") is not None]
+    assert [p["seq"] for p in seqd] == [100, 101, 102, 103, 104, 105, 106]
+    noseq = [p for p in merged if p.get("seq") is None]
+    assert len(noseq) == 1 and noseq[0]["src"] in {"gs1-noseq", "gs2-noseq-dup-ts"}
+
+def test_detect_anomalies_and_episodes():
+    base = datetime(2025, 10, 19, 12, 0, 0)
+    pkts = [
+        {"timestamp": iso(base, 0),  "THERMAL": {"temp_batt": 79.0}, "POWER": {"bus_voltage": 24.0, "current_draw": 1.0}},
+        {"timestamp": iso(base, 5),  "THERMAL": {"temp_batt": 81.0}, "POWER": {"bus_voltage": 24.0, "current_draw": 1.0}},
+        {"timestamp": iso(base, 10), "THERMAL": {"temp_batt": 82.0}, "POWER": {"bus_voltage": 19.9, "current_draw": -1.0, "mode": "normal"}},
+        {"timestamp": iso(base, 15), "THERMAL": {"temp_batt": 78.0}, "POWER": {"bus_voltage": 24.0, "current_draw": -2.0, "mode": "regen"}},
+        {"timestamp": iso(base, 20), "NAV": {"quaternion": [float("nan"), 0.1, 0.2, 0.3]}},
+        {"timestamp": iso(base, 25), "THERMAL": {"temp_batt": 79.0}, "POWER": {"bus_voltage": 24.0, "current_draw": 1.0}},
+    ]
+    anomalies = detect_anomalies(pkts)
+    # Expect anomalies at t=5 (temp), t=10 (temp+bus+current), t=20 (quat NaN)
+    times = {p["timestamp"] for p in anomalies}
+    assert times == {iso(base, 5), iso(base, 10), iso(base, 20)}
+
+    eps = detect_anomaly_episodes(pkts)
+    # temp high episode spans from 5s to 15s (ended when temp dropped at 15s)
+    temp_eps = eps["battery_temp_high"]
+    assert len(temp_eps) == 1
+    assert temp_eps[0]["start"] == iso(base, 5)
+    assert temp_eps[0]["end"]   == iso(base, 15)
+    # bus voltage low only at t=10 -> zero-length episode
+    bus_eps = eps["bus_voltage_low"]
+    assert len(bus_eps) == 1 and bus_eps[0]["start"] == iso(base, 10)
+    # negative current flagged at t=10 only (regen at 15 suppresses)
+    neg_eps = eps["negative_current"]
+    assert len(neg_eps) == 1 and neg_eps[0]["start"] == iso(base, 10)
+    # quaternion NaN at t=20 only
+    quat_eps = eps["quaternion_nan"]
+    assert len(quat_eps) == 1 and quat_eps[0]["start"] == iso(base, 20)
